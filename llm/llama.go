@@ -59,6 +59,7 @@ ws ::= ([ \t\n] ws)?
 var llamaCppEmbed embed.FS
 
 type ModelRunner struct {
+	Type        string // "gguf" or "ggml"
 	Path        string // path to the model runner executable
 	Accelerated bool
 }
@@ -72,25 +73,25 @@ func chooseRunners(workDir, runnerType string) []ModelRunner {
 	switch runtime.GOOS {
 	case "darwin":
 		if runtime.GOARCH == "arm64" {
-			runners = []ModelRunner{{Path: path.Join(buildPath, "metal", "bin", "ollama-runner")}}
+			runners = []ModelRunner{{Type: runnerType, Path: path.Join(buildPath, "metal", "bin", "ollama-runner")}}
 		} else {
-			runners = []ModelRunner{{Path: path.Join(buildPath, "cpu", "bin", "ollama-runner")}}
+			runners = []ModelRunner{{Type: runnerType, Path: path.Join(buildPath, "cpu", "bin", "ollama-runner")}}
 		}
 	case "linux":
 		runners = []ModelRunner{
-			{Path: path.Join(buildPath, "cuda", "bin", "ollama-runner"), Accelerated: true},
-			{Path: path.Join(buildPath, "cpu", "bin", "ollama-runner")},
+			{Type: runnerType, Path: path.Join(buildPath, "cuda", "bin", "ollama-runner"), Accelerated: true},
+			{Type: runnerType, Path: path.Join(buildPath, "cpu", "bin", "ollama-runner")},
 		}
 	case "windows":
 		// TODO: select windows GPU runner here when available
 		runners = []ModelRunner{
-			{Path: path.Join(buildPath, "cuda", "bin", "Release", "ollama-runner.exe"), Accelerated: true},
-			{Path: path.Join(buildPath, "cpu", "bin", "Release", "ollama-runner.exe")},
+			{Type: runnerType, Path: path.Join(buildPath, "cuda", "bin", "Release", "ollama-runner.exe"), Accelerated: true},
+			{Type: runnerType, Path: path.Join(buildPath, "cpu", "bin", "Release", "ollama-runner.exe")},
 		}
 	default:
 		log.Printf("unknown OS, running on CPU: %s", runtime.GOOS)
 		runners = []ModelRunner{
-			{Path: path.Join(buildPath, "cpu", "bin", "ollama-runner")},
+			{Type: runnerType, Path: path.Join(buildPath, "cpu", "bin", "ollama-runner")},
 		}
 	}
 
@@ -148,6 +149,7 @@ func chooseRunners(workDir, runnerType string) []ModelRunner {
 	for _, r := range runners {
 		// clean the ModelRunner paths so that they match the OS we are running on
 		localRunnersByPriority = append(localRunnersByPriority, ModelRunner{
+			Type:        r.Type,
 			Path:        filepath.Clean(path.Join(workDir, r.Path)),
 			Accelerated: r.Accelerated,
 		})
@@ -325,7 +327,7 @@ func (w *StatusWriter) Write(b []byte) (int, error) {
 	return os.Stderr.Write(b)
 }
 
-func newLlama(model string, adapters []string, runners []ModelRunner, numLayers int64, opts api.Options) (*llama, error) {
+func newLlama(model string, adapters, projectors []string, runners []ModelRunner, numLayers int64, opts api.Options) (*llama, error) {
 	fileInfo, err := os.Stat(model)
 	if err != nil {
 		return nil, err
@@ -365,6 +367,11 @@ func newLlama(model string, adapters []string, runners []ModelRunner, numLayers 
 		params = append(params, "--lora", adapters[0])
 	}
 
+	if len(projectors) > 0 {
+		// TODO: applying multiple projectors is not supported by the llama.cpp server yet
+		params = append(params, "--mmproj", projectors[0])
+	}
+
 	if opts.NumThread > 0 {
 		params = append(params, "--threads", fmt.Sprintf("%d", opts.NumThread))
 	}
@@ -397,11 +404,17 @@ func newLlama(model string, adapters []string, runners []ModelRunner, numLayers 
 		}
 
 		port := rand.Intn(65535-49152) + 49152 // get a random port in the ephemeral range
+		params := append(params, "--port", strconv.Itoa(port))
+
+		if runner.Type == "gguf" {
+			params = append(params, "--parallel", "2")
+		}
+
 		ctx, cancel := context.WithCancel(context.Background())
 		cmd := exec.CommandContext(
 			ctx,
 			runner.Path,
-			append(params, "--port", strconv.Itoa(port))...,
+			params...,
 		)
 
 		var libraryPaths []string
@@ -531,21 +544,28 @@ type prediction struct {
 
 const maxBufferSize = 512 * format.KiloByte
 
-func (llm *llama) Predict(ctx context.Context, prevContext []int, prompt string, format string, fn func(api.GenerateResponse)) error {
-	prevConvo, err := llm.Decode(ctx, prevContext)
-	if err != nil {
-		return err
-	}
+type PredictOpts struct {
+	Prompt           string
+	Format           string
+	CheckpointStart  time.Time
+	CheckpointLoaded time.Time
+}
 
-	// Remove leading spaces from prevConvo if present
-	prevConvo = strings.TrimPrefix(prevConvo, " ")
+type PredictResult struct {
+	CreatedAt          time.Time
+	TotalDuration      time.Duration
+	LoadDuration       time.Duration
+	Content            string
+	Done               bool
+	PromptEvalCount    int
+	PromptEvalDuration time.Duration
+	EvalCount          int
+	EvalDuration       time.Duration
+}
 
-	var nextContext strings.Builder
-	nextContext.WriteString(prevConvo)
-	nextContext.WriteString(prompt)
-
+func (llm *llama) Predict(ctx context.Context, predict PredictOpts, fn func(PredictResult)) error {
 	request := map[string]any{
-		"prompt":            nextContext.String(),
+		"prompt":            predict.Prompt,
 		"stream":            true,
 		"n_predict":         llm.NumPredict,
 		"n_keep":            llm.NumKeep,
@@ -567,7 +587,7 @@ func (llm *llama) Predict(ctx context.Context, prevContext []int, prompt string,
 		"stop":              llm.Stop,
 	}
 
-	if format == "json" {
+	if predict.Format == "json" {
 		request["grammar"] = jsonGrammar
 	}
 
@@ -617,34 +637,35 @@ func (llm *llama) Predict(ctx context.Context, prevContext []int, prompt string,
 				continue
 			}
 
-			if evt, ok := bytes.CutPrefix(line, []byte("data: ")); ok {
-				var p prediction
-				if err := json.Unmarshal(evt, &p); err != nil {
-					return fmt.Errorf("error unmarshaling llm prediction response: %v", err)
-				}
+			evt, ok := bytes.CutPrefix(line, []byte("data: "))
+			if !ok {
+				return fmt.Errorf("error parsing llm response stream: %s", line)
+			}
 
-				if p.Content != "" {
-					fn(api.GenerateResponse{Response: p.Content})
-					nextContext.WriteString(p.Content)
-				}
+			var p prediction
+			if err := json.Unmarshal(evt, &p); err != nil {
+				return fmt.Errorf("error unmarshaling llm prediction response: %v", err)
+			}
 
-				if p.Stop {
-					embd, err := llm.Encode(ctx, nextContext.String())
-					if err != nil {
-						return fmt.Errorf("encoding context: %v", err)
-					}
+			if p.Content != "" {
+				fn(PredictResult{
+					CreatedAt: time.Now().UTC(),
+					Content:   p.Content,
+				})
+			}
 
-					fn(api.GenerateResponse{
-						Done:               true,
-						Context:            embd,
-						PromptEvalCount:    p.Timings.PromptN,
-						PromptEvalDuration: parseDurationMs(p.Timings.PromptMS),
-						EvalCount:          p.Timings.PredictedN,
-						EvalDuration:       parseDurationMs(p.Timings.PredictedMS),
-					})
+			if p.Stop {
+				fn(PredictResult{
+					CreatedAt:     time.Now().UTC(),
+					TotalDuration: time.Since(predict.CheckpointStart),
 
-					return nil
-				}
+					Done:               true,
+					PromptEvalCount:    p.Timings.PromptN,
+					PromptEvalDuration: parseDurationMs(p.Timings.PromptMS),
+					EvalCount:          p.Timings.PredictedN,
+					EvalDuration:       parseDurationMs(p.Timings.PredictedMS),
+				})
+				return nil
 			}
 		}
 	}

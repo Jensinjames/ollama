@@ -133,7 +133,7 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	request := api.CreateRequest{Name: args[0], Modelfile: string(modelfile)}
-	if err := client.Create(context.Background(), &request, fn); err != nil {
+	if err := client.Create(cmd.Context(), &request, fn); err != nil {
 		return err
 	}
 
@@ -148,7 +148,7 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 
 	name := args[0]
 	// check if the model exists on the server
-	_, err = client.Show(context.Background(), &api.ShowRequest{Name: name})
+	_, err = client.Show(cmd.Context(), &api.ShowRequest{Name: name})
 	var statusError api.StatusError
 	switch {
 	case errors.As(err, &statusError) && statusError.StatusCode == http.StatusNotFound:
@@ -208,7 +208,7 @@ func PushHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	request := api.PushRequest{Name: args[0], Insecure: insecure}
-	if err := client.Push(context.Background(), &request, fn); err != nil {
+	if err := client.Push(cmd.Context(), &request, fn); err != nil {
 		return err
 	}
 
@@ -222,7 +222,7 @@ func ListHandler(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	models, err := client.List(context.Background())
+	models, err := client.List(cmd.Context())
 	if err != nil {
 		return err
 	}
@@ -257,7 +257,7 @@ func DeleteHandler(cmd *cobra.Command, args []string) error {
 
 	for _, name := range args {
 		req := api.DeleteRequest{Name: name}
-		if err := client.Delete(context.Background(), &req); err != nil {
+		if err := client.Delete(cmd.Context(), &req); err != nil {
 			return err
 		}
 		fmt.Printf("deleted '%s'\n", name)
@@ -322,7 +322,7 @@ func ShowHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	req := api.ShowRequest{Name: args[0]}
-	resp, err := client.Show(context.Background(), &req)
+	resp, err := client.Show(cmd.Context(), &req)
 	if err != nil {
 		return err
 	}
@@ -350,7 +350,7 @@ func CopyHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	req := api.CopyRequest{Source: args[0], Destination: args[1]}
-	if err := client.Copy(context.Background(), &req); err != nil {
+	if err := client.Copy(cmd.Context(), &req); err != nil {
 		return err
 	}
 	fmt.Printf("copied '%s' to '%s'\n", args[0], args[1])
@@ -404,7 +404,7 @@ func PullHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	request := api.PullRequest{Name: args[0], Insecure: insecure}
-	if err := client.Pull(context.Background(), &request, fn); err != nil {
+	if err := client.Pull(cmd.Context(), &request, fn); err != nil {
 		return err
 	}
 
@@ -493,7 +493,7 @@ func generate(cmd *cobra.Command, opts generateOptions) error {
 		opts.WordWrap = false
 	}
 
-	cancelCtx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
 	sigChan := make(chan os.Signal, 1)
@@ -507,23 +507,22 @@ func generate(cmd *cobra.Command, opts generateOptions) error {
 	var currentLineLength int
 	var wordBuffer string
 
-	request := api.GenerateRequest{
-		Model:    opts.Model,
-		Prompt:   opts.Prompt,
-		Context:  generateContext,
-		Format:   opts.Format,
-		System:   opts.System,
-		Template: opts.Template,
-		Options:  opts.Options,
-	}
 	fn := func(response api.GenerateResponse) error {
 		p.StopAndClear()
 
 		latest = response
 
-		if opts.WordWrap {
+		termWidth, _, _ = term.GetSize(int(os.Stdout.Fd()))
+		if opts.WordWrap && termWidth >= 10 {
 			for _, ch := range response.Response {
 				if currentLineLength+1 > termWidth-5 {
+					if len(wordBuffer) > termWidth-10 {
+						fmt.Printf("%s%c", wordBuffer, ch)
+						wordBuffer = ""
+						currentLineLength = 0
+						continue
+					}
+
 					// backtrack the length of the last word and clear to the end of the line
 					fmt.Printf("\x1b[%dD\x1b[K\n", len(wordBuffer))
 					fmt.Printf("%s%c", wordBuffer, ch)
@@ -543,13 +542,26 @@ func generate(cmd *cobra.Command, opts generateOptions) error {
 				}
 			}
 		} else {
-			fmt.Print(response.Response)
+			fmt.Printf("%s%s", wordBuffer, response.Response)
+			if len(wordBuffer) > 0 {
+				wordBuffer = ""
+			}
 		}
 
 		return nil
 	}
 
-	if err := client.Generate(cancelCtx, &request, fn); err != nil {
+	request := api.GenerateRequest{
+		Model:    opts.Model,
+		Prompt:   opts.Prompt,
+		Context:  generateContext,
+		Format:   opts.Format,
+		System:   opts.System,
+		Template: opts.Template,
+		Options:  opts.Options,
+	}
+
+	if err := client.Generate(ctx, &request, fn); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
@@ -573,10 +585,7 @@ func generate(cmd *cobra.Command, opts generateOptions) error {
 		latest.Summary()
 	}
 
-	ctx := cmd.Context()
-	ctx = context.WithValue(ctx, generateContextKey("context"), latest.Context)
-	cmd.SetContext(ctx)
-
+	cmd.SetContext(context.WithValue(cmd.Context(), generateContextKey("context"), latest.Context))
 	return nil
 }
 
@@ -705,11 +714,11 @@ func generateInteractive(cmd *cobra.Command, opts generateOptions) error {
 			case MultilineSystem:
 				opts.System = prompt
 				prompt = ""
-				fmt.Println("Set system template.\n")
+				fmt.Println("Set system template.")
 			case MultilineTemplate:
 				opts.Template = prompt
 				prompt = ""
-				fmt.Println("Set model template.\n")
+				fmt.Println("Set model template.")
 			}
 			multiline = MultilineNone
 		case strings.HasPrefix(line, `"""`) && len(prompt) == 0:
@@ -784,9 +793,9 @@ func generateInteractive(cmd *cobra.Command, opts generateOptions) error {
 						if found {
 							opts.System = prompt
 							if args[1] == "system" {
-								fmt.Println("Set system template.\n")
+								fmt.Println("Set system template.")
 							} else {
-								fmt.Println("Set prompt template.\n")
+								fmt.Println("Set prompt template.")
 							}
 							prompt = ""
 						} else {
@@ -800,7 +809,7 @@ func generateInteractive(cmd *cobra.Command, opts generateOptions) error {
 						}
 					} else {
 						opts.System = line
-						fmt.Println("Set system template.\n")
+						fmt.Println("Set system template.")
 					}
 				default:
 					fmt.Printf("Unknown command '/set %s'. Type /? for help\n", args[1])
@@ -977,7 +986,7 @@ func initializeKeypair() error {
 	return nil
 }
 
-func startMacApp(client *api.Client) error {
+func startMacApp(ctx context.Context, client *api.Client) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -1001,24 +1010,24 @@ func startMacApp(client *api.Client) error {
 		case <-timeout:
 			return errors.New("timed out waiting for server to start")
 		case <-tick:
-			if err := client.Heartbeat(context.Background()); err == nil {
+			if err := client.Heartbeat(ctx); err == nil {
 				return nil // server has started
 			}
 		}
 	}
 }
 
-func checkServerHeartbeat(_ *cobra.Command, _ []string) error {
+func checkServerHeartbeat(cmd *cobra.Command, _ []string) error {
 	client, err := api.ClientFromEnvironment()
 	if err != nil {
 		return err
 	}
-	if err := client.Heartbeat(context.Background()); err != nil {
+	if err := client.Heartbeat(cmd.Context()); err != nil {
 		if !strings.Contains(err.Error(), "connection refused") {
 			return err
 		}
 		if runtime.GOOS == "darwin" {
-			if err := startMacApp(client); err != nil {
+			if err := startMacApp(cmd.Context(), client); err != nil {
 				return fmt.Errorf("could not connect to ollama app, is it running?")
 			}
 		} else {
@@ -1028,8 +1037,29 @@ func checkServerHeartbeat(_ *cobra.Command, _ []string) error {
 	return nil
 }
 
+func versionHandler(cmd *cobra.Command, _ []string) {
+	client, err := api.ClientFromEnvironment()
+	if err != nil {
+		return
+	}
+
+	serverVersion, err := client.Version(cmd.Context())
+	if err != nil {
+		fmt.Println("Warning: could not connect to a running Ollama instance")
+	}
+
+	if serverVersion != "" {
+		fmt.Printf("ollama version is %s\n", serverVersion)
+	}
+
+	if serverVersion != version.Version {
+		fmt.Printf("Warning: client version is %s\n", version.Version)
+	}
+}
+
 func NewCLI() *cobra.Command {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	cobra.EnableCommandSorting = false
 
 	rootCmd := &cobra.Command{
 		Use:           "ollama",
@@ -1039,10 +1069,17 @@ func NewCLI() *cobra.Command {
 		CompletionOptions: cobra.CompletionOptions{
 			DisableDefaultCmd: true,
 		},
-		Version: version.Version,
+		Run: func(cmd *cobra.Command, args []string) {
+			if version, _ := cmd.Flags().GetBool("version"); version {
+				versionHandler(cmd, args)
+				return
+			}
+
+			cmd.Print(cmd.UsageString())
+		},
 	}
 
-	cobra.EnableCommandSorting = false
+	rootCmd.Flags().BoolP("version", "v", false, "Show version information")
 
 	createCmd := &cobra.Command{
 		Use:     "create MODEL",

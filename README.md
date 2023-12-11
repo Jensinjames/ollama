@@ -205,7 +205,8 @@ Finally, in a separate shell, run a model:
 ## REST API
 
 Ollama has a REST API for running and managing models.
-For example, to generate text from a model:
+
+### Generate a response
 
 ```
 curl http://localhost:11434/api/generate -d '{
@@ -214,13 +215,20 @@ curl http://localhost:11434/api/generate -d '{
 }'
 ```
 
+### Chat with a model
+
+```
+curl http://localhost:11434/api/chat -d '{
+  "model": "mistral",
+  "messages": [
+    { "role": "user", "content": "why is the sky blue?" }
+  ]
+}'
+```
+
 See the [API documentation](./docs/api.md) for all endpoints.
 
 ## Community Integrations
-
-### Mobile
-
-- [Mobile Artificial Intelligence Distribution](https://github.com/MaidFoundation/Maid) (Maid)
 
 ### Web & Desktop
 
@@ -277,6 +285,7 @@ See the [API documentation](./docs/api.md) for all endpoints.
 - [Logseq Ollama plugin](https://github.com/omagdy7/ollama-logseq)
 - [Dagger Chatbot](https://github.com/samalba/dagger-chatbot)
 - [Discord AI Bot](https://github.com/mekb-turtle/discord-ai-bot)
+- [Ollama Telegram Bot](https://github.com/ruecat/ollama-telegram)
 - [Hass Ollama Conversation](https://github.com/ej52/hass-ollama-conversation)
 - [Rivet plugin](https://github.com/abrenneke/rivet-plugin-ollama)
 - [Llama Coder](https://github.com/ex3ndr/llama-coder) (Copilot alternative using Ollama)
