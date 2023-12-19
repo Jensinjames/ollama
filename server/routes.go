@@ -32,6 +32,10 @@ import (
 
 var mode string = gin.DebugMode
 
+type Server struct {
+	WorkDir string
+}
+
 func init() {
 	switch mode {
 	case gin.DebugMode:
@@ -156,9 +160,9 @@ func GenerateHandler(c *gin.Context) {
 	defer loaded.mu.Unlock()
 
 	checkpointStart := time.Now()
-
 	var req api.GenerateRequest
 	err := c.ShouldBindJSON(&req)
+
 	switch {
 	case errors.Is(err, io.EOF):
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
@@ -261,12 +265,10 @@ func GenerateHandler(c *gin.Context) {
 
 			resp := api.GenerateResponse{
 				Model:     req.Model,
-				CreatedAt: r.CreatedAt,
+				CreatedAt: time.Now().UTC(),
 				Done:      r.Done,
 				Response:  r.Content,
 				Metrics: api.Metrics{
-					TotalDuration:      r.TotalDuration,
-					LoadDuration:       r.LoadDuration,
 					PromptEvalCount:    r.PromptEvalCount,
 					PromptEvalDuration: r.PromptEvalDuration,
 					EvalCount:          r.EvalCount,
@@ -274,13 +276,18 @@ func GenerateHandler(c *gin.Context) {
 				},
 			}
 
-			if r.Done && !req.Raw {
-				embd, err := loaded.runner.Encode(c.Request.Context(), prompt+generated.String())
-				if err != nil {
-					ch <- gin.H{"error": err.Error()}
-					return
+			if r.Done {
+				resp.TotalDuration = time.Since(checkpointStart)
+				resp.LoadDuration = checkpointLoaded.Sub(checkpointStart)
+
+				if !req.Raw {
+					embd, err := loaded.runner.Encode(c.Request.Context(), prompt+generated.String())
+					if err != nil {
+						ch <- gin.H{"error": err.Error()}
+						return
+					}
+					resp.Context = embd
 				}
-				resp.Context = embd
 			}
 
 			ch <- resp
@@ -288,10 +295,9 @@ func GenerateHandler(c *gin.Context) {
 
 		// Start prediction
 		predictReq := llm.PredictOpts{
-			Prompt:           prompt,
-			Format:           req.Format,
-			CheckpointStart:  checkpointStart,
-			CheckpointLoaded: checkpointLoaded,
+			Prompt: prompt,
+			Format: req.Format,
+			Images: req.Images,
 		}
 		if err := loaded.runner.Predict(c.Request.Context(), predictReq, fn); err != nil {
 			ch <- gin.H{"error": err.Error()}
@@ -614,10 +620,19 @@ func GetModelInfo(name string) (*api.ShowResponse, error) {
 		return nil, err
 	}
 
+	modelDetails := api.ModelDetails{
+		Format:            model.Config.ModelFormat,
+		Family:            model.Config.ModelFamily,
+		Families:          model.Config.ModelFamilies,
+		ParameterSize:     model.Config.ModelType,
+		QuantizationLevel: model.Config.FileType,
+	}
+
 	resp := &api.ShowResponse{
 		License:  strings.Join(model.License, "\n"),
 		System:   model.System,
 		Template: model.Template,
+		Details:  modelDetails,
 	}
 
 	mf, err := ShowModelfile(model)
@@ -667,25 +682,42 @@ func ListModelsHandler(c *gin.Context) {
 		return
 	}
 
+	modelResponse := func(modelName string) (api.ModelResponse, error) {
+		model, err := GetModel(modelName)
+		if err != nil {
+			return api.ModelResponse{}, err
+		}
+
+		modelDetails := api.ModelDetails{
+			Format:            model.Config.ModelFormat,
+			Family:            model.Config.ModelFamily,
+			Families:          model.Config.ModelFamilies,
+			ParameterSize:     model.Config.ModelType,
+			QuantizationLevel: model.Config.FileType,
+		}
+
+		return api.ModelResponse{
+			Name:    model.ShortName,
+			Size:    model.Size,
+			Digest:  model.Digest,
+			Details: modelDetails,
+		}, nil
+	}
+
 	walkFunc := func(path string, info os.FileInfo, _ error) error {
 		if !info.IsDir() {
 			dir, file := filepath.Split(path)
 			dir = strings.Trim(strings.TrimPrefix(dir, fp), string(os.PathSeparator))
 			tag := strings.Join([]string{dir, file}, ":")
 
-			mp := ParseModelPath(tag)
-			manifest, digest, err := GetManifest(mp)
+			resp, err := modelResponse(tag)
 			if err != nil {
 				log.Printf("skipping file: %s", fp)
 				return nil
 			}
 
-			models = append(models, api.ModelResponse{
-				Name:       mp.GetShortTagname(),
-				Size:       manifest.GetTotalSize(),
-				Digest:     digest,
-				ModifiedAt: info.ModTime(),
-			})
+			resp.ModifiedAt = info.ModTime()
+			models = append(models, resp)
 		}
 
 		return nil
@@ -772,27 +804,27 @@ var defaultAllowOrigins = []string{
 	"0.0.0.0",
 }
 
-func Serve(ln net.Listener, allowOrigins []string) error {
-	if noprune := os.Getenv("OLLAMA_NOPRUNE"); noprune == "" {
-		// clean up unused layers and manifests
-		if err := PruneLayers(); err != nil {
-			return err
-		}
+func NewServer() (*Server, error) {
+	workDir, err := os.MkdirTemp("", "ollama")
+	if err != nil {
+		return nil, err
+	}
 
-		manifestsPath, err := GetManifestPath()
-		if err != nil {
-			return err
-		}
+	return &Server{
+		WorkDir: workDir,
+	}, nil
+}
 
-		if err := PruneDirectory(manifestsPath); err != nil {
-			return err
-		}
+func (s *Server) GenerateRoutes() http.Handler {
+	var origins []string
+	if o := os.Getenv("OLLAMA_ORIGINS"); o != "" {
+		origins = strings.Split(o, ",")
 	}
 
 	config := cors.DefaultConfig()
 	config.AllowWildcard = true
 
-	config.AllowOrigins = allowOrigins
+	config.AllowOrigins = origins
 	for _, allowOrigin := range defaultAllowOrigins {
 		config.AllowOrigins = append(config.AllowOrigins,
 			fmt.Sprintf("http://%s", allowOrigin),
@@ -802,17 +834,11 @@ func Serve(ln net.Listener, allowOrigins []string) error {
 		)
 	}
 
-	workDir, err := os.MkdirTemp("", "ollama")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(workDir)
-
 	r := gin.Default()
 	r.Use(
 		cors.New(config),
 		func(c *gin.Context) {
-			c.Set("workDir", workDir)
+			c.Set("workDir", s.WorkDir)
 			c.Next()
 		},
 	)
@@ -840,8 +866,34 @@ func Serve(ln net.Listener, allowOrigins []string) error {
 		})
 	}
 
+	return r
+}
+
+func Serve(ln net.Listener) error {
+	if noprune := os.Getenv("OLLAMA_NOPRUNE"); noprune == "" {
+		// clean up unused layers and manifests
+		if err := PruneLayers(); err != nil {
+			return err
+		}
+
+		manifestsPath, err := GetManifestPath()
+		if err != nil {
+			return err
+		}
+
+		if err := PruneDirectory(manifestsPath); err != nil {
+			return err
+		}
+	}
+
+	s, err := NewServer()
+	if err != nil {
+		return err
+	}
+	r := s.GenerateRoutes()
+
 	log.Printf("Listening on %s (version %s)", ln.Addr(), version.Version)
-	s := &http.Server{
+	srvr := &http.Server{
 		Handler: r,
 	}
 
@@ -853,7 +905,7 @@ func Serve(ln net.Listener, allowOrigins []string) error {
 		if loaded.runner != nil {
 			loaded.runner.Close()
 		}
-		os.RemoveAll(workDir)
+		os.RemoveAll(s.WorkDir)
 		os.Exit(0)
 	}()
 
@@ -864,7 +916,7 @@ func Serve(ln net.Listener, allowOrigins []string) error {
 		}
 	}
 
-	return s.Serve(ln)
+	return srvr.Serve(ln)
 }
 
 func waitForStream(c *gin.Context, ch chan interface{}) {
@@ -961,13 +1013,13 @@ func ChatHandler(c *gin.Context) {
 
 	// an empty request loads the model
 	if len(req.Messages) == 0 {
-		c.JSON(http.StatusOK, api.ChatResponse{CreatedAt: time.Now().UTC(), Model: req.Model, Done: true})
+		c.JSON(http.StatusOK, api.ChatResponse{CreatedAt: time.Now().UTC(), Model: req.Model, Done: true, Message: api.Message{Role: "assistant"}})
 		return
 	}
 
 	checkpointLoaded := time.Now()
 
-	prompt, err := model.ChatPrompt(req.Messages)
+	prompt, images, err := model.ChatPrompt(req.Messages)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -985,11 +1037,10 @@ func ChatHandler(c *gin.Context) {
 
 			resp := api.ChatResponse{
 				Model:     req.Model,
-				CreatedAt: r.CreatedAt,
+				CreatedAt: time.Now().UTC(),
+				Message:   api.Message{Role: "assistant", Content: r.Content},
 				Done:      r.Done,
 				Metrics: api.Metrics{
-					TotalDuration:      r.TotalDuration,
-					LoadDuration:       r.LoadDuration,
 					PromptEvalCount:    r.PromptEvalCount,
 					PromptEvalDuration: r.PromptEvalDuration,
 					EvalCount:          r.EvalCount,
@@ -997,8 +1048,9 @@ func ChatHandler(c *gin.Context) {
 				},
 			}
 
-			if !r.Done {
-				resp.Message = &api.Message{Role: "assistant", Content: r.Content}
+			if r.Done {
+				resp.TotalDuration = time.Since(checkpointStart)
+				resp.LoadDuration = checkpointLoaded.Sub(checkpointStart)
 			}
 
 			ch <- resp
@@ -1006,10 +1058,9 @@ func ChatHandler(c *gin.Context) {
 
 		// Start prediction
 		predictReq := llm.PredictOpts{
-			Prompt:           prompt,
-			Format:           req.Format,
-			CheckpointStart:  checkpointStart,
-			CheckpointLoaded: checkpointLoaded,
+			Prompt: prompt,
+			Format: req.Format,
+			Images: images,
 		}
 		if err := loaded.runner.Predict(c.Request.Context(), predictReq, fn); err != nil {
 			ch <- gin.H{"error": err.Error()}
@@ -1023,10 +1074,7 @@ func ChatHandler(c *gin.Context) {
 		for resp := range ch {
 			switch r := resp.(type) {
 			case api.ChatResponse:
-				if r.Message != nil {
-					sb.WriteString(r.Message.Content)
-				}
-
+				sb.WriteString(r.Message.Content)
 				final = r
 			case gin.H:
 				if errorMsg, ok := r["error"].(string); ok {
@@ -1042,7 +1090,7 @@ func ChatHandler(c *gin.Context) {
 			}
 		}
 
-		final.Message = &api.Message{Role: "assistant", Content: sb.String()}
+		final.Message = api.Message{Role: "assistant", Content: sb.String()}
 		c.JSON(http.StatusOK, final)
 		return
 	}
