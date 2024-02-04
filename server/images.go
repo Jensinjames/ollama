@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+	"text/template/parse"
 
 	"golang.org/x/exp/slices"
 
@@ -39,7 +41,7 @@ type Model struct {
 	Config         ConfigV2
 	ShortName      string
 	ModelPath      string
-	OriginalModel  string
+	ParentModel    string
 	AdapterPaths   []string
 	ProjectorPaths []string
 	Template       string
@@ -48,6 +50,12 @@ type Model struct {
 	Digest         string
 	Size           int64
 	Options        map[string]interface{}
+	Messages       []Message
+}
+
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
 type PromptVars struct {
@@ -55,19 +63,38 @@ type PromptVars struct {
 	Prompt   string
 	Response string
 	First    bool
+	Images   []llm.ImageData
 }
 
-func (m *Model) Prompt(p PromptVars) (string, error) {
-	var prompt strings.Builder
-	// Use the "missingkey=zero" option to handle missing variables without panicking
-	tmpl, err := template.New("").Option("missingkey=zero").Parse(m.Template)
+// extractParts extracts the parts of the template before and after the {{.Response}} node.
+func extractParts(tmplStr string) (pre string, post string, err error) {
+	tmpl, err := template.New("").Parse(tmplStr)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	if p.System == "" {
-		// use the default system message for this model if one is not specified
-		p.System = m.System
+	var foundResponse bool
+
+	for _, node := range tmpl.Tree.Root.Nodes {
+		if node.Type() == parse.NodeAction && node.String() == "{{.Response}}" {
+			foundResponse = true
+		}
+		if !foundResponse {
+			pre += node.String()
+		} else {
+			post += node.String()
+		}
+	}
+
+	return pre, post, nil
+}
+
+func Prompt(promptTemplate string, p PromptVars) (string, error) {
+	var prompt strings.Builder
+	// Use the "missingkey=zero" option to handle missing variables without panicking
+	tmpl, err := template.New("").Option("missingkey=zero").Parse(promptTemplate)
+	if err != nil {
+		return "", err
 	}
 
 	vars := map[string]any{
@@ -82,63 +109,106 @@ func (m *Model) Prompt(p PromptVars) (string, error) {
 		return "", err
 	}
 	prompt.WriteString(sb.String())
-	prompt.WriteString(p.Response)
+
+	if !strings.Contains(prompt.String(), p.Response) {
+		// if the response is not in the prompt template, append it to the end
+		prompt.WriteString(p.Response)
+	}
+
 	return prompt.String(), nil
 }
 
-func (m *Model) ChatPrompt(msgs []api.Message) (string, []api.ImageData, error) {
-	// build the prompt from the list of messages
-	var prompt strings.Builder
-	var currentImages []api.ImageData
-	currentVars := PromptVars{
-		First: true,
+// PreResponsePrompt returns the prompt before the response tag
+func (m *Model) PreResponsePrompt(p PromptVars) (string, error) {
+	pre, _, err := extractParts(m.Template)
+	if err != nil {
+		return "", err
 	}
 
-	writePrompt := func() error {
-		p, err := m.Prompt(currentVars)
-		if err != nil {
-			return err
-		}
-		prompt.WriteString(p)
-		currentVars = PromptVars{}
-		return nil
+	return Prompt(pre, p)
+}
+
+// PostResponseTemplate returns the template after the response tag
+func (m *Model) PostResponseTemplate(p PromptVars) (string, error) {
+	if p.System == "" {
+		// use the default system prompt for this model if one is not specified
+		p.System = m.System
 	}
+	_, post, err := extractParts(m.Template)
+	if err != nil {
+		return "", err
+	}
+
+	if post == "" {
+		// if there is no post-response template, return the provided response
+		return p.Response, nil
+	}
+
+	return Prompt(post, p)
+}
+
+type ChatHistory struct {
+	Prompts    []PromptVars
+	LastSystem string
+}
+
+// ChatPrompts returns a list of formatted chat prompts from a list of messages
+func (m *Model) ChatPrompts(msgs []api.Message) (*ChatHistory, error) {
+	// build the prompt from the list of messages
+	lastSystem := m.System
+	currentVars := PromptVars{
+		First:  true,
+		System: m.System,
+	}
+
+	prompts := []PromptVars{}
+	var images []llm.ImageData
 
 	for _, msg := range msgs {
 		switch strings.ToLower(msg.Role) {
 		case "system":
-			if currentVars.System != "" {
-				if err := writePrompt(); err != nil {
-					return "", nil, err
-				}
+			// if this is the first message it overrides the system prompt in the modelfile
+			if !currentVars.First && currentVars.System != "" {
+				prompts = append(prompts, currentVars)
+				currentVars = PromptVars{}
 			}
 			currentVars.System = msg.Content
+			lastSystem = msg.Content
 		case "user":
 			if currentVars.Prompt != "" {
-				if err := writePrompt(); err != nil {
-					return "", nil, err
-				}
+				prompts = append(prompts, currentVars)
+				currentVars = PromptVars{}
 			}
+
 			currentVars.Prompt = msg.Content
-			currentImages = msg.Images
+			for i := range msg.Images {
+				id := len(images) + i
+				currentVars.Prompt += fmt.Sprintf(" [img-%d]", id)
+				currentVars.Images = append(currentVars.Images, llm.ImageData{
+					ID:   id,
+					Data: msg.Images[i],
+				})
+			}
+
+			images = append(images, currentVars.Images...)
 		case "assistant":
 			currentVars.Response = msg.Content
-			if err := writePrompt(); err != nil {
-				return "", nil, err
-			}
+			prompts = append(prompts, currentVars)
+			currentVars = PromptVars{}
 		default:
-			return "", nil, fmt.Errorf("invalid role: %s, role must be one of [system, user, assistant]", msg.Role)
+			return nil, fmt.Errorf("invalid role: %s, role must be one of [system, user, assistant]", msg.Role)
 		}
 	}
 
 	// Append the last set of vars if they are non-empty
 	if currentVars.Prompt != "" || currentVars.System != "" {
-		if err := writePrompt(); err != nil {
-			return "", nil, err
-		}
+		prompts = append(prompts, currentVars)
 	}
 
-	return prompt.String(), currentImages, nil
+	return &ChatHistory{
+		Prompts:    prompts,
+		LastSystem: lastSystem,
+	}, nil
 }
 
 type ManifestV2 struct {
@@ -272,11 +342,11 @@ func GetModel(name string) (*Model, error) {
 		switch layer.MediaType {
 		case "application/vnd.ollama.image.model":
 			model.ModelPath = filename
-			model.OriginalModel = layer.From
+			model.ParentModel = layer.From
 		case "application/vnd.ollama.image.embed":
 			// Deprecated in versions  > 0.1.2
 			// TODO: remove this warning in a future version
-			log.Print("WARNING: model contains embeddings, but embeddings in modelfiles have been deprecated and will be ignored.")
+			slog.Info("WARNING: model contains embeddings, but embeddings in modelfiles have been deprecated and will be ignored.")
 		case "application/vnd.ollama.image.adapter":
 			model.AdapterPaths = append(model.AdapterPaths, filename)
 		case "application/vnd.ollama.image.projector":
@@ -311,6 +381,16 @@ func GetModel(name string) (*Model, error) {
 
 			// parse model options parameters into a map so that we can see which fields have been specified explicitly
 			if err = json.NewDecoder(params).Decode(&model.Options); err != nil {
+				return nil, err
+			}
+		case "application/vnd.ollama.image.messages":
+			msgs, err := os.Open(filename)
+			if err != nil {
+				return nil, err
+			}
+			defer msgs.Close()
+
+			if err = json.NewDecoder(msgs).Decode(&model.Messages); err != nil {
 				return nil, err
 			}
 		case "application/vnd.ollama.image.license":
@@ -351,6 +431,13 @@ func realpath(mfDir, from string) string {
 }
 
 func CreateModel(ctx context.Context, name, modelFileDir string, commands []parser.Command, fn func(resp api.ProgressResponse)) error {
+	deleteMap := make(map[string]struct{})
+	if manifest, _, err := GetManifest(ParseModelPath(name)); err == nil {
+		for _, layer := range append(manifest.Layers, manifest.Config) {
+			deleteMap[layer.Digest] = struct{}{}
+		}
+	}
+
 	config := ConfigV2{
 		OS:           "linux",
 		Architecture: "amd64",
@@ -359,15 +446,13 @@ func CreateModel(ctx context.Context, name, modelFileDir string, commands []pars
 		},
 	}
 
-	deleteMap := make(map[string]struct{})
-
 	var layers Layers
+	messages := []string{}
 
 	params := make(map[string][]string)
 	fromParams := make(map[string]any)
 
 	for _, c := range commands {
-		log.Printf("[%s] - %s", c.Name, c.Args)
 		mediatype := fmt.Sprintf("application/vnd.ollama.image.%s", c.Name)
 
 		switch c.Name {
@@ -418,6 +503,11 @@ func CreateModel(ctx context.Context, name, modelFileDir string, commands []pars
 					return err
 				}
 
+				// if the model is still not in gguf format, error out
+				if fromConfig.ModelFormat != "gguf" {
+					return fmt.Errorf("%s is not in gguf format, this base model is not compatible with this version of ollama", c.Args)
+				}
+
 				config.SetModelFormat(fromConfig.ModelFormat)
 				config.SetModelFamily(append(fromConfig.ModelFamilies, fromConfig.ModelFamily)...)
 				config.SetModelType(fromConfig.ModelType)
@@ -456,15 +546,21 @@ func CreateModel(ctx context.Context, name, modelFileDir string, commands []pars
 			defer bin.Close()
 
 			var offset int64
+		CREATE:
 			for {
 				fn(api.ProgressResponse{Status: "creating model layer"})
 
 				bin.Seek(offset, io.SeekStart)
 				ggml, err := llm.DecodeGGML(bin)
-				if errors.Is(err, io.EOF) {
-					break
-				} else if err != nil {
-					return err
+				if err != nil {
+					switch {
+					case errors.Is(err, io.EOF):
+						break CREATE
+					case errors.Is(err, llm.ErrUnsupportedFormat):
+						return fmt.Errorf("model binary specified in FROM field is not a valid gguf format model, %w", err)
+					default:
+						return err
+					}
 				}
 
 				config.SetModelFormat(ggml.Name())
@@ -530,9 +626,35 @@ func CreateModel(ctx context.Context, name, modelFileDir string, commands []pars
 			}
 
 			layers.Replace(layer)
+		case "message":
+			messages = append(messages, c.Args)
 		default:
 			params[c.Name] = append(params[c.Name], c.Args)
 		}
+	}
+
+	if len(messages) > 0 {
+		fn(api.ProgressResponse{Status: "creating parameters layer"})
+
+		msgs := make([]api.Message, 0)
+
+		for _, m := range messages {
+			// todo: handle images
+			msg := strings.SplitN(m, ": ", 2)
+			msgs = append(msgs, api.Message{Role: msg[0], Content: msg[1]})
+		}
+
+		var b bytes.Buffer
+		if err := json.NewEncoder(&b).Encode(msgs); err != nil {
+			return err
+		}
+
+		layer, err := NewLayer(&b, "application/vnd.ollama.image.messages")
+		if err != nil {
+			return err
+		}
+
+		layers.Replace(layer)
 	}
 
 	if len(params) > 0 {
@@ -676,6 +798,7 @@ func deleteUnusedLayers(skipModelPath *ModelPath, deleteMap map[string]struct{},
 		// save (i.e. delete from the deleteMap) any files used in other manifests
 		manifest, _, err := GetManifest(fmp)
 		if err != nil {
+			// nolint: nilerr
 			return nil
 		}
 
@@ -695,16 +818,16 @@ func deleteUnusedLayers(skipModelPath *ModelPath, deleteMap map[string]struct{},
 	for k := range deleteMap {
 		fp, err := GetBlobsPath(k)
 		if err != nil {
-			log.Printf("couldn't get file path for '%s': %v", k, err)
+			slog.Info(fmt.Sprintf("couldn't get file path for '%s': %v", k, err))
 			continue
 		}
 		if !dryRun {
 			if err := os.Remove(fp); err != nil {
-				log.Printf("couldn't remove file '%s': %v", fp, err)
+				slog.Info(fmt.Sprintf("couldn't remove file '%s': %v", fp, err))
 				continue
 			}
 		} else {
-			log.Printf("wanted to remove: %s", fp)
+			slog.Info(fmt.Sprintf("wanted to remove: %s", fp))
 		}
 	}
 
@@ -720,7 +843,7 @@ func PruneLayers() error {
 
 	blobs, err := os.ReadDir(p)
 	if err != nil {
-		log.Printf("couldn't read dir '%s': %v", p, err)
+		slog.Info(fmt.Sprintf("couldn't read dir '%s': %v", p, err))
 		return err
 	}
 
@@ -734,14 +857,14 @@ func PruneLayers() error {
 		}
 	}
 
-	log.Printf("total blobs: %d", len(deleteMap))
+	slog.Info(fmt.Sprintf("total blobs: %d", len(deleteMap)))
 
 	err = deleteUnusedLayers(nil, deleteMap, false)
 	if err != nil {
 		return err
 	}
 
-	log.Printf("total unused blobs removed: %d", len(deleteMap))
+	slog.Info(fmt.Sprintf("total unused blobs removed: %d", len(deleteMap)))
 
 	return nil
 }
@@ -803,7 +926,7 @@ func DeleteModel(name string) error {
 	}
 	err = os.Remove(fp)
 	if err != nil {
-		log.Printf("couldn't remove manifest file '%s': %v", fp, err)
+		slog.Info(fmt.Sprintf("couldn't remove manifest file '%s': %v", fp, err))
 		return err
 	}
 
@@ -830,8 +953,8 @@ func ShowModelfile(model *Model) (string, error) {
 	mt.Model = model
 	mt.From = model.ModelPath
 
-	if model.OriginalModel != "" {
-		mt.From = model.OriginalModel
+	if model.ParentModel != "" {
+		mt.From = model.ParentModel
 	}
 
 	modelFile := `# Modelfile generated by "ollama show"
@@ -857,14 +980,14 @@ PARAMETER {{ $k }} {{ printf "%#v" $parameter }}
 
 	tmpl, err := template.New("").Parse(modelFile)
 	if err != nil {
-		log.Printf("error parsing template: %q", err)
+		slog.Info(fmt.Sprintf("error parsing template: %q", err))
 		return "", err
 	}
 
 	var buf bytes.Buffer
 
 	if err = tmpl.Execute(&buf, mt); err != nil {
-		log.Printf("error executing template: %q", err)
+		slog.Info(fmt.Sprintf("error executing template: %q", err))
 		return "", err
 	}
 
@@ -891,7 +1014,7 @@ func PushModel(ctx context.Context, name string, regOpts *RegistryOptions, fn fu
 
 	for _, layer := range layers {
 		if err := uploadBlob(ctx, mp, layer, regOpts, fn); err != nil {
-			log.Printf("error uploading blob: %v", err)
+			slog.Info(fmt.Sprintf("error uploading blob: %v", err))
 			if errors.Is(err, errUnauthorized) {
 				return fmt.Errorf("unable to push %s, make sure this namespace exists and you are authorized to push to it", ParseModelPath(name).GetNamespaceRepository())
 			}
@@ -986,7 +1109,7 @@ func PullModel(ctx context.Context, name string, regOpts *RegistryOptions, fn fu
 				}
 				if err := os.Remove(fp); err != nil {
 					// log this, but return the original error
-					log.Printf("couldn't remove file with digest mismatch '%s': %v", fp, err)
+					slog.Info(fmt.Sprintf("couldn't remove file with digest mismatch '%s': %v", fp, err))
 				}
 			}
 			return err
@@ -1010,7 +1133,7 @@ func PullModel(ctx context.Context, name string, regOpts *RegistryOptions, fn fu
 
 	err = os.WriteFile(fp, manifestJSON, 0o644)
 	if err != nil {
-		log.Printf("couldn't write to %s", fp)
+		slog.Info(fmt.Sprintf("couldn't write to %s", fp))
 		return err
 	}
 
@@ -1060,49 +1183,46 @@ func GetSHA256Digest(r io.Reader) (string, int64) {
 var errUnauthorized = fmt.Errorf("unauthorized")
 
 func makeRequestWithRetry(ctx context.Context, method string, requestURL *url.URL, headers http.Header, body io.ReadSeeker, regOpts *RegistryOptions) (*http.Response, error) {
-	resp, err := makeRequest(ctx, method, requestURL, headers, body, regOpts)
-	if err != nil {
-		if !errors.Is(err, context.Canceled) {
-			log.Printf("request failed: %v", err)
-		}
-
-		return nil, err
-	}
-
-	switch {
-	case resp.StatusCode == http.StatusUnauthorized:
-		// Handle authentication error with one retry
-		auth := resp.Header.Get("www-authenticate")
-		authRedir := ParseAuthRedirectString(auth)
-		token, err := getAuthToken(ctx, authRedir)
+	for i := 0; i < 2; i++ {
+		resp, err := makeRequest(ctx, method, requestURL, headers, body, regOpts)
 		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				slog.Info(fmt.Sprintf("request failed: %v", err))
+			}
+
 			return nil, err
 		}
-		regOpts.Token = token
-		if body != nil {
-			_, err = body.Seek(0, io.SeekStart)
+
+		switch {
+		case resp.StatusCode == http.StatusUnauthorized:
+			// Handle authentication error with one retry
+			auth := resp.Header.Get("www-authenticate")
+			authRedir := ParseAuthRedirectString(auth)
+			token, err := getAuthToken(ctx, authRedir)
 			if err != nil {
 				return nil, err
 			}
+			regOpts.Token = token
+			if body != nil {
+				_, err = body.Seek(0, io.SeekStart)
+				if err != nil {
+					return nil, err
+				}
+			}
+		case resp.StatusCode == http.StatusNotFound:
+			return nil, os.ErrNotExist
+		case resp.StatusCode >= http.StatusBadRequest:
+			responseBody, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return nil, fmt.Errorf("%d: %s", resp.StatusCode, err)
+			}
+			return nil, fmt.Errorf("%d: %s", resp.StatusCode, responseBody)
+		default:
+			return resp, nil
 		}
-
-		resp, err := makeRequest(ctx, method, requestURL, headers, body, regOpts)
-		if resp.StatusCode == http.StatusUnauthorized {
-			return nil, errUnauthorized
-		}
-
-		return resp, err
-	case resp.StatusCode == http.StatusNotFound:
-		return nil, os.ErrNotExist
-	case resp.StatusCode >= http.StatusBadRequest:
-		responseBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("%d: %s", resp.StatusCode, err)
-		}
-		return nil, fmt.Errorf("%d: %s", resp.StatusCode, responseBody)
 	}
 
-	return resp, nil
+	return nil, errUnauthorized
 }
 
 func makeRequest(ctx context.Context, method string, requestURL *url.URL, headers http.Header, body io.Reader, regOpts *RegistryOptions) (*http.Response, error) {

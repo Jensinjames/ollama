@@ -78,80 +78,17 @@ type model interface {
 	ModelFamily() string
 	ModelType() string
 	FileType() string
-	NumLayers() int64
+	NumLayers() uint32
+	NumGQA() uint32
+	NumEmbed() uint32
+	NumHead() uint32
+	NumHeadKv() uint32
+	NumCtx() uint32
 }
 
 type container interface {
 	Name() string
 	Decode(*readSeekOffset) (model, error)
-}
-
-type containerGGML struct{}
-
-func (c *containerGGML) Name() string {
-	return "ggml"
-}
-
-func (c *containerGGML) Decode(ro *readSeekOffset) (model, error) {
-	// file contents aren't decoded
-	ro.Seek(0, io.SeekEnd)
-	return nil, nil
-}
-
-type containerGGMF struct {
-	version uint32
-}
-
-func (c *containerGGMF) Name() string {
-	return "ggmf"
-}
-
-func (c *containerGGMF) Decode(ro *readSeekOffset) (model, error) {
-	var version uint32
-	binary.Read(ro, binary.LittleEndian, &version)
-
-	switch version {
-	case 1:
-	default:
-		return nil, errors.New("invalid version")
-	}
-
-	c.version = version
-
-	// remaining file contents aren't decoded
-	ro.Seek(0, io.SeekEnd)
-
-	return nil, nil
-}
-
-type containerGGJT struct {
-	version uint32
-}
-
-func (c *containerGGJT) Name() string {
-	return "ggjt"
-}
-
-func (c *containerGGJT) Decode(ro *readSeekOffset) (model, error) {
-	var version uint32
-	binary.Read(ro, binary.LittleEndian, &version)
-
-	switch version {
-	case 1, 2, 3:
-	default:
-		return nil, errors.New("invalid version")
-	}
-
-	c.version = version
-
-	// different model types may have different layouts for hyperparameters
-	var llama llamaModel
-	binary.Read(ro, binary.LittleEndian, &llama.hyperparameters)
-
-	// remaining file contents aren't decoded
-	ro.Seek(0, io.SeekEnd)
-
-	return &llama, nil
 }
 
 type containerLORA struct {
@@ -162,9 +99,9 @@ func (c *containerLORA) Name() string {
 	return "ggla"
 }
 
-func (c *containerLORA) Decode(ro *readSeekOffset) (model, error) {
+func (c *containerLORA) Decode(rso *readSeekOffset) (model, error) {
 	var version uint32
-	binary.Read(ro, binary.LittleEndian, &version)
+	binary.Read(rso, binary.LittleEndian, &version)
 
 	switch version {
 	case 1:
@@ -175,7 +112,7 @@ func (c *containerLORA) Decode(ro *readSeekOffset) (model, error) {
 	c.version = version
 
 	// remaining file contents aren't decoded
-	ro.Seek(0, io.SeekEnd)
+	rso.Seek(0, io.SeekEnd)
 
 	return nil, nil
 }
@@ -194,6 +131,8 @@ const (
 	FILE_MAGIC_GGUF_BE = 0x47475546
 )
 
+var ErrUnsupportedFormat = errors.New("unsupported model format")
+
 func DecodeGGML(r io.ReadSeeker) (*GGML, error) {
 	ro := readSeekOffset{ReadSeeker: r}
 
@@ -204,12 +143,8 @@ func DecodeGGML(r io.ReadSeeker) (*GGML, error) {
 
 	var c container
 	switch magic {
-	case FILE_MAGIC_GGML:
-		c = &containerGGML{}
-	case FILE_MAGIC_GGMF:
-		c = &containerGGMF{}
-	case FILE_MAGIC_GGJT:
-		c = &containerGGJT{}
+	case FILE_MAGIC_GGML, FILE_MAGIC_GGMF, FILE_MAGIC_GGJT:
+		return nil, ErrUnsupportedFormat
 	case FILE_MAGIC_GGLA:
 		c = &containerLORA{}
 	case FILE_MAGIC_GGUF_LE:
